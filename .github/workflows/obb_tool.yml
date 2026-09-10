@@ -4,13 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       action_type:
-        description: 'Action'
+        description: 'Action (unpack ya repack)'
         required: true
         default: 'unpack'
         type: choice
         options:
           - unpack
           - repack
+      aes_key:
+        description: '(Optional) AES Key agar PAK encrypted ho'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -30,16 +34,12 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           python3 -c '
           import os, subprocess
-          changed = False
           for item in os.listdir("."):
               if os.path.isdir(item) and (item.endswith(" ") or "PC" in item):
-                  res = subprocess.run(["git", "mv", item, "tools"])
-                  if res.returncode == 0:
-                      changed = True
-          if changed:
-              subprocess.run(["git", "commit", "-m", "Clean tool folder [skip ci]"])
-              subprocess.run(["git", "push", "origin", "HEAD:main"])
+                  subprocess.run(["git", "mv", item, "tools"])
           '
+          git add tools/ 2>/dev/null || true
+          git diff --staged --quiet || (git commit -m "Normalize tool folder [skip ci]" && git push origin HEAD:main)
 
   process:
     needs: fix-folder-names
@@ -51,30 +51,34 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Auto-Detect, Merge & Extract
+      - name: Multi-Binary Extraction & UAsset Processing
         shell: powershell
         run: |
-          Write-Host "=== STEP 1: Directories Setup ==="
+          Write-Host "=========================================="
+          Write-Host " STEP 1: Tool & Binary Discovery"
+          Write-Host "=========================================="
           if (-not (Test-Path "original_pak")) { New-Item -ItemType Directory -Path "original_pak" }
           if (-not (Test-Path "unpacked")) { New-Item -ItemType Directory -Path "unpacked" }
 
-          Write-Host "=== STEP 2: Tool Detection ==="
-          $bmsScript = (Get-ChildItem -Recurse -Filter "script.bms" | Select-Object -First 1).FullName
+          # Tool discovery across repo
           $quickbms = (Get-ChildItem -Recurse -Filter "quickbms_4gb_files.exe" | Select-Object -First 1).FullName
-          if (-not $quickbms) {
-              $quickbms = (Get-ChildItem -Recurse -Filter "quickbms.exe" | Select-Object -First 1).FullName
-          }
+          if (-not $quickbms) { $quickbms = (Get-ChildItem -Recurse -Filter "quickbms.exe" | Select-Object -First 1).FullName }
 
-          Write-Host "QuickBMS: $quickbms"
-          Write-Host "Script: $bmsScript"
+          $bmsScript = (Get-ChildItem -Recurse -Filter "script.bms" | Select-Object -First 1).FullName
+          $uassetGui = (Get-ChildItem -Recurse -Filter "UAssetGUI.exe" | Select-Object -First 1).FullName
 
-          Write-Host "=== STEP 3: File Detection & Merging ==="
+          Write-Host "QuickBMS Binary : $quickbms"
+          Write-Host "Local BMS Script: $bmsScript"
+          Write-Host "UAssetGUI Binary: $uassetGui"
+
+          Write-Host "`n=========================================="
+          Write-Host " STEP 2: Input File Detection"
+          Write-Host "=========================================="
           $targetPath = $null
 
+          # Part chunks recombine agar split upload hui ho
           $parts = Get-ChildItem -Path "original_pak" -File | Where-Object { $_.Name -match "\.part_\d+$" } | Sort-Object Name
-          if (-not $parts) {
-              $parts = Get-ChildItem -Recurse -File | Where-Object { $_.Name -match "\.part_\d+$" } | Sort-Object Name
-          }
+          if (-not $parts) { $parts = Get-ChildItem -Recurse -File | Where-Object { $_.Name -match "\.part_\d+$" } | Sort-Object Name }
 
           if ($parts.Count -gt 0) {
               Write-Host "Merging $($parts.Count) split chunk(s)..."
@@ -88,26 +92,76 @@ jobs:
               $targetPath = (Get-Item $mergedFile).FullName
           } else {
               $target = Get-ChildItem -Path "original_pak" -File | Where-Object { $_.Extension -match "\.(pak|obb)$" } | Select-Object -First 1
-              if (-not $target) {
-                  $target = Get-ChildItem -Recurse -File | Where-Object { $_.Extension -match "\.(pak|obb)$" } | Select-Object -First 1
-              }
-              if ($target) {
-                  $targetPath = $target.FullName
-              }
+              if (-not $target) { $target = Get-ChildItem -Recurse -File | Where-Object { $_.Extension -match "\.(pak|obb)$" } | Select-Object -First 1 }
+              if ($target) { $targetPath = $target.FullName }
           }
 
           if (-not $targetPath -or -not (Test-Path $targetPath)) {
-              Write-Error "No game package found!"
+              Write-Error "Koi bhi .pak ya .obb file nahi mili!"
+              exit 1
+          }
+          Write-Host "Target Confirmed: $targetPath ($([math]::Round((Get-Item $targetPath).Length/1MB, 2)) MB)"
+
+          Write-Host "`n=========================================="
+          Write-Host " STEP 3: Execution (Auto-Fallback Engine)"
+          Write-Host "=========================================="
+          $action = "${{ github.event.inputs.action_type }}"
+          $extractedCount = 0
+
+          if ($action -eq "unpack") {
+              # Try Method 1: Local script.bms
+              Write-Host "[Method 1] Running QuickBMS with local script.bms..."
+              & "$quickbms" -o -y -e "$bmsScript" "$targetPath" "unpacked"
+              $extractedCount = (Get-ChildItem -Path "unpacked" -Recurse -File).Count
+
+              # If 0 files found, file is Unreal PAK, switch to UE4 script
+              if ($extractedCount -eq 0) {
+                  Write-Host "`n[Method 2] 0 files found with OBB script. Switching to Unreal Engine PAK script..."
+                  $ue4Script = "ue4_pak.bms"
+                  Invoke-WebRequest -Uri "https://aluigi.altervista.org/bms/unreal_tournament_4.bms" -OutFile $ue4Script -UserAgent "QuickBMS"
+
+                  $keyArg = "${{ github.event.inputs.aes_key }}".Trim()
+                  if ($keyArg -ne "") {
+                      Write-Host "Using provided AES Key..."
+                      & "$quickbms" -o -y -e -s "set AES_KEY string $keyArg" "$ue4Script" "$targetPath" "unpacked"
+                  } else {
+                      & "$quickbms" -o -y -e "$ue4Script" "$targetPath" "unpacked"
+                  }
+                  $extractedCount = (Get-ChildItem -Path "unpacked" -Recurse -File).Count
+              }
+
+              # Try Method 3: 7-Zip extraction fallback (agar OBB/Zip container ho)
+              if ($extractedCount -eq 0) {
+                  Write-Host "`n[Method 3] Testing 7-Zip Container extraction..."
+                  7z x "$targetPath" "-ounpacked" -y
+                  $extractedCount = (Get-ChildItem -Path "unpacked" -Recurse -File).Count
+              }
+          } else {
+              # Repack logic using QuickBMS reimporter
+              Write-Host "Running QuickBMS Reimport..."
+              & "$quickbms" -r -w -y -e "$bmsScript" "$targetPath" "unpacked"
+              $extractedCount = 1
+          }
+
+          Write-Host "`nTotal Extracted Files: $extractedCount"
+          if ($extractedCount -eq 0) {
+              Write-Error "Extraction fail ho gayi! File format check karein ya AES Key dein."
               exit 1
           }
 
-          Write-Host "Target Verified: $targetPath"
-
-          $action = "${{ github.event.inputs.action_type }}"
-          if ($action -eq "unpack") {
-              & "$quickbms" -o "$bmsScript" "$targetPath" "unpacked"
-          } else {
-              & "$quickbms" -r -w "$bmsScript" "$targetPath" "unpacked"
+          Write-Host "`n=========================================="
+          Write-Host " STEP 4: Processing .uasset via UAssetGUI"
+          Write-Host "=========================================="
+          if ($uassetGui -and (Test-Path $uassetGui)) {
+              $uassets = Get-ChildItem -Path "unpacked" -Recurse -Filter "*.uasset"
+              Write-Host "Found $($uassets.Count) .uasset file(s)."
+              foreach ($u in ($uassets | Select-Object -First 5)) {
+                  Write-Host "Inspecting: $($u.Name)"
+                  # Run UAssetGUI headless export if supported
+                  try {
+                      & "$uassetGui" "$($u.FullName)" "$($u.FullName).json" 2>$null
+                  } catch {}
+              }
           }
 
       - name: Commit and Push unpacked files to Repo
@@ -117,13 +171,13 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
           git pull origin main --rebase || true
-          git add unpacked/
+          git add -f unpacked/
 
           if ! git diff --staged --quiet; then
             echo "Committing extracted files..."
-            git commit -m "Auto-unpacked files committed [skip ci]"
+            git commit -m "Auto-unpacked assets extracted [skip ci]"
             git push origin HEAD:main
-            echo "SUCCESS: Unpacked files successfully pushed to repo!"
+            echo "SUCCESS: Extracted assets pushed to repo unpacked/ directory!"
           else
             echo "No new files to commit in unpacked/."
           fi
