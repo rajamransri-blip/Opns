@@ -32,7 +32,14 @@ jobs:
           mkdir -p app/src/main/res/values
           mkdir -p gradle/wrapper
 
-          # 2. Root settings.gradle.kts
+          # 2. Fix Missing AndroidX Flags (Root gradle.properties)
+          cat << 'EOF' > gradle.properties
+          android.useAndroidX=true
+          android.enableJetifier=true
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          EOF
+
+          # 3. Root settings.gradle.kts
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
               repositories {
@@ -52,7 +59,7 @@ jobs:
           include(":app")
           EOF
 
-          # 3. Root build.gradle.kts
+          # 4. Root build.gradle.kts
           cat << 'EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
@@ -60,7 +67,7 @@ jobs:
           }
           EOF
 
-          # 4. App Module build.gradle.kts
+          # 5. App Module build.gradle.kts
           cat << 'EOF' > app/build.gradle.kts
           plugins {
               id("com.android.application")
@@ -114,7 +121,14 @@ jobs:
           }
           EOF
 
-          # 5. AndroidManifest.xml
+          # 6. Values / strings.xml
+          cat << 'EOF' > app/src/main/res/values/strings.xml
+          <resources>
+              <string name="app_name">PAK Bot Server</string>
+          </resources>
+          EOF
+
+          # 7. AndroidManifest.xml
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -124,7 +138,7 @@ jobs:
               <application
                   android:allowBackup="true"
                   android:icon="@android:drawable/sym_def_app_icon"
-                  android:label="PAK Bot Server"
+                  android:label="@string/app_name"
                   android:roundIcon="@android:drawable/sym_def_app_icon"
                   android:supportsRtl="true"
                   android:theme="@android:style/Theme.Material.NoActionBar">
@@ -140,7 +154,7 @@ jobs:
           </manifest>
           EOF
 
-          # 6. Theme & Colors (Jetpack Compose Dark Theme)
+          # 8. Theme.kt
           cat << 'EOF' > app/src/main/java/com/pak/manager/ui/theme/Theme.kt
           package com.pak.manager.ui.theme
 
@@ -169,14 +183,13 @@ jobs:
           }
           EOF
 
-          # 7. Complete MainActivity.kt (UI Dashboard + Bot Server Config)
+          # 9. MainActivity.kt
           cat << 'EOF' > app/src/main/java/com/pak/manager/MainActivity.kt
           package com.pak.manager
 
           import android.os.Bundle
           import androidx.activity.ComponentActivity
           import androidx.activity.compose.setContent
-          import androidx.compose.foundation.background
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material.icons.Icons
@@ -208,7 +221,6 @@ jobs:
               }
           }
 
-          @OptIn(ExperimentalMaterial3Api::class)
           @Composable
           fun BotServerDashboard() {
               var botToken by remember { mutableStateOf("") }
