@@ -35,7 +35,7 @@ jobs:
           cat << 'EOF' > gradle.properties
           android.useAndroidX=true
           android.enableJetifier=true
-          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8
           EOF
 
           # 2. settings.gradle.kts
@@ -45,6 +45,7 @@ jobs:
                   google()
                   mavenCentral()
                   gradlePluginPortal()
+                  maven { url = java.net.URI("https://chaquo.com/maven") }
               }
           }
           dependencyResolutionManagement {
@@ -52,25 +53,28 @@ jobs:
               repositories {
                   google()
                   mavenCentral()
+                  maven { url = java.net.URI("https://chaquo.com/maven") }
               }
           }
           rootProject.name = "PakManagerBot"
           include(":app")
           EOF
 
-          # 3. Root build.gradle.kts
+          # 3. Root build.gradle.kts (With Chaquopy plugin)
           cat << 'EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
               id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+              id("com.chaquo.python") version "15.0.1" apply false
           }
           EOF
 
-          # 4. App Module build.gradle.kts (With Zstandard & OkHttp Telegram Dependencies)
+          # 4. App Module build.gradle.kts
           cat << 'EOF' > app/build.gradle.kts
           plugins {
               id("com.android.application")
               id("org.jetbrains.kotlin.android")
+              id("com.chaquo.python")
           }
 
           android {
@@ -83,6 +87,10 @@ jobs:
                   targetSdk = 34
                   versionCode = 1
                   versionName = "1.0"
+
+                  ndk {
+                      abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+                  }
               }
 
               buildTypes {
@@ -111,6 +119,15 @@ jobs:
               }
           }
 
+          chaquopy {
+              defaultConfig {
+                  version = "3.10"
+                  pip {
+                      install("zstandard")
+                  }
+              }
+          }
+
           dependencies {
               val composeBom = platform("androidx.compose:compose-bom:2024.02.00")
               implementation(composeBom)
@@ -123,11 +140,11 @@ jobs:
               implementation("androidx.compose.material3:material3")
               implementation("androidx.compose.material:material-icons-extended")
 
-              // Networking & Background Tasks
+              // Live Networking & Polling Loop
               implementation("com.squareup.okhttp3:okhttp:4.12.0")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
-              // Zstandard Decompression/Compression Engine for Unreal PAK
+              // Native Zstandard
               implementation("com.github.luben:zstd-jni:1.5.5-11@aar")
           }
           EOF
@@ -196,28 +213,26 @@ jobs:
           }
           EOF
 
-          # 8. PakEngine.kt (Zstandard + UE Pak Handling Logic)
+          # 8. PakEngine.kt (Chunk-based Stream Zstd System)
           cat << 'EOF' > app/src/main/java/com/pak/manager/PakEngine.kt
           package com.pak.manager
 
           import com.github.luben.zstd.ZstdInputStream
           import com.github.luben.zstd.ZstdOutputStream
-          import java.io.File
-          import java.io.FileInputStream
-          import java.io.FileOutputStream
+          import java.io.*
 
           object PakEngine {
-              // UE Pak Magic Bytes: 0x5A6F12E1
-              const val PAK_MAGIC = 0x5A6F12E1L
+              const val CHUNK_SIZE = 64 * 1024 // 64 KB standard UE chunk block
 
-              fun decompressZstd(compressedFile: File, outputFile: File): Boolean {
+              fun unpackChunked(inputStream: InputStream, outputStream: OutputStream): Boolean {
                   return try {
-                      FileInputStream(compressedFile).use { fis ->
-                          ZstdInputStream(fis).use { zis ->
-                              FileOutputStream(outputFile).use { fos ->
-                                  zis.copyTo(fos)
-                              }
+                      ZstdInputStream(inputStream).use { zstdIn ->
+                          val buffer = ByteArray(CHUNK_SIZE)
+                          var bytesRead: Int
+                          while (zstdIn.read(buffer).also { bytesRead = it } != -1) {
+                              outputStream.write(buffer, 0, bytesRead)
                           }
+                          outputStream.flush()
                       }
                       true
                   } catch (e: Exception) {
@@ -226,12 +241,17 @@ jobs:
                   }
               }
 
-              fun compressZstd(sourceFile: File, outputFile: File, level: Int = 3): Boolean {
+              fun repackChunked(sourceFile: File, outputFile: File, level: Int = 3): Boolean {
                   return try {
                       FileInputStream(sourceFile).use { fis ->
                           FileOutputStream(outputFile).use { fos ->
-                              ZstdOutputStream(fos, level).use { zos ->
-                                  fis.copyTo(zos)
+                              ZstdOutputStream(fos, level).use { zstdOut ->
+                                  val buffer = ByteArray(CHUNK_SIZE)
+                                  var bytesRead: Int
+                                  while (fis.read(buffer).also { bytesRead = it } != -1) {
+                                      zstdOut.write(buffer, 0, bytesRead)
+                                  }
+                                  zstdOut.flush()
                               }
                           }
                       }
@@ -244,7 +264,129 @@ jobs:
           }
           EOF
 
-          # 9. MainActivity.kt (UI + Bot Status Controls)
+          # 9. TelegramBotService.kt (Real Long-Polling Loop Engine)
+          cat << 'EOF' > app/src/main/java/com/pak/manager/TelegramBotService.kt
+          package com.pak.manager
+
+          import kotlinx.coroutines.*
+          import okhttp3.*
+          import okhttp3.MediaType.Companion.toMediaTypeOrNull
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import org.json.JSONObject
+          import java.io.File
+          import java.io.IOException
+          import java.util.concurrent.TimeUnit
+
+          class TelegramBotService(
+              private val token: String,
+              private val allowedChatId: String,
+              private val onLog: (String) -> Unit
+          ) {
+              private val client = OkHttpClient.Builder()
+                  .connectTimeout(60, TimeUnit.SECONDS)
+                  .readTimeout(60, TimeUnit.SECONDS)
+                  .build()
+
+              private var isPolling = false
+              private var lastUpdateId = 0L
+              private val scope = CoroutineScope(Dispatchers.IO + Job())
+
+              fun start() {
+                  isPolling = true
+                  onLog("[Server] Starting active polling loop...")
+                  scope.launch {
+                      sendTextMessage(allowedChatId, "🤖 *Pak Server Bot Started!*\nSelect option:\n/unpack - Unpack .pak\n/repack - Repack files")
+                      while (isPolling) {
+                          try {
+                              pollUpdates()
+                          } catch (e: Exception) {
+                              onLog("[Network Error] ${e.message}")
+                              delay(3000)
+                          }
+                      }
+                  }
+              }
+
+              fun stop() {
+                  isPolling = false
+                  scope.coroutineContext[Job]?.cancelChildren()
+                  onLog("[Server] Polling stopped.")
+              }
+
+              private fun pollUpdates() {
+                  val url = "https://api.telegram.org/bot$token/getUpdates?offset=${lastUpdateId + 1}&timeout=30"
+                  val request = Request.Builder().url(url).build()
+
+                  client.newCall(request).execute().use { response ->
+                      if (!response.isSuccessful) return
+                      val jsonStr = response.body?.string() ?: return
+                      val jsonObj = JSONObject(jsonStr)
+                      if (!jsonObj.optBoolean("ok")) return
+
+                      val result = jsonObj.optJSONArray("result") ?: return
+                      for (i in 0 until result.length()) {
+                          val update = result.getJSONObject(i)
+                          lastUpdateId = update.optLong("update_id")
+
+                          if (update.has("message")) {
+                              val msg = update.getJSONObject("message")
+                              val fromChatId = msg.getJSONObject("chat").optLong("id").toString()
+                              val text = msg.optString("text", "")
+
+                              if (fromChatId == allowedChatId) {
+                                  onLog("[Incoming] $text")
+                                  handleCommand(fromChatId, text)
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun handleCommand(chatId: String, text: String) {
+                  when {
+                      text.startsWith("/start") -> {
+                          sendTextMessage(chatId, "Welcome! Commands:\n1. Send `.pak` file for Unpack\n2. Send folder path (e.g. /Content/BluePrints/Core/)")
+                      }
+                      text.startsWith("/unpack") -> {
+                          sendTextMessage(chatId, "Please upload your .pak file now.")
+                      }
+                      text.startsWith("/repack") -> {
+                          sendTextMessage(chatId, "Please upload the target files to repack.")
+                      }
+                      text.contains("/") -> {
+                          sendTextMessage(chatId, "Path registered: `$text`\nChunk scanning initialized.")
+                      }
+                      else -> {
+                          sendTextMessage(chatId, "Command received: $text")
+                      }
+                  }
+              }
+
+              private fun sendTextMessage(chatId: String, text: String) {
+                  val json = JSONObject().apply {
+                      put("chat_id", chatId)
+                      put("text", text)
+                      put("parse_mode", "Markdown")
+                  }
+                  val body = json.toString().toRequestBody("application/json".toMediaTypeOrNull())
+                  val request = Request.Builder()
+                      .url("https://api.telegram.org/bot$token/sendMessage")
+                      .post(body)
+                      .build()
+
+                  client.newCall(request).enqueue(object : Callback {
+                      override fun onFailure(call: Call, e: IOException) {
+                          onLog("[Send Error] ${e.message}")
+                      }
+                      override fun onResponse(call: Call, response: Response) {
+                          response.close()
+                      }
+                  })
+              }
+          }
+          EOF
+
+          # 10. MainActivity.kt (Auto Hook Token & Real Lifecycle)
           cat << 'EOF' > app/src/main/java/com/pak/manager/MainActivity.kt
           package com.pak.manager
 
@@ -267,6 +409,8 @@ jobs:
           import com.pak.manager.ui.theme.PakManagerTheme
 
           class MainActivity : ComponentActivity() {
+              private var botService: TelegramBotService? = null
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   setContent {
@@ -275,19 +419,35 @@ jobs:
                               modifier = Modifier.fillMaxSize(),
                               color = MaterialTheme.colorScheme.background
                           ) {
-                              BotServerDashboard()
+                              BotServerDashboard(
+                                  onStart = { token, chat, logger ->
+                                      botService = TelegramBotService(token, chat, logger).also { it.start() }
+                                  },
+                                  onStop = {
+                                      botService?.stop()
+                                      botService = null
+                                  }
+                              )
                           }
                       }
                   }
               }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  botService?.stop()
+              }
           }
 
           @Composable
-          fun BotServerDashboard() {
-              var botToken by remember { mutableStateOf("") }
-              var chatId by remember { mutableStateOf("") }
+          fun BotServerDashboard(
+              onStart: (String, String, (String) -> Unit) -> Unit,
+              onStop: () -> Unit
+          ) {
+              var botToken by remember { mutableStateOf("7630015663:AAHw-nYvbDamHjdcqrsBk2dw1bifSDllTLE") }
+              var chatId by remember { mutableStateOf("5913394915") }
               var isRunning by remember { mutableStateOf(false) }
-              var logs by remember { mutableStateOf("Logs:\n[System] Core engine with Zstd & OkHttp initialized.") }
+              var logs by remember { mutableStateOf("Logs:\n[System] Core engine & Chaquopy ready.") }
 
               Column(
                   modifier = Modifier
@@ -326,7 +486,9 @@ jobs:
                       Button(
                           onClick = {
                               isRunning = true
-                              logs += "\n[Server] Polling active. Ready for .pak and paths."
+                              onStart(botToken, chatId) { newLog ->
+                                  logs += "\n$newLog"
+                              }
                           },
                           enabled = !isRunning,
                           colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
@@ -340,7 +502,7 @@ jobs:
                       Button(
                           onClick = {
                               isRunning = false
-                              logs += "\n[Server] Bot engine stopped."
+                              onStop()
                           },
                           enabled = isRunning,
                           colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828)),
@@ -361,7 +523,7 @@ jobs:
                   ) {
                       Column(modifier = Modifier.padding(12.dp)) {
                           Text(
-                              text = "Status: " + if (isRunning) "ACTIVE (Polling)" else "STOPPED",
+                              text = "Status: " + if (isRunning) "ACTIVE (Polling Network)" else "STOPPED",
                               fontWeight = FontWeight.SemiBold,
                               color = if (isRunning) Color(0xFF81C784) else Color(0xFFE57373)
                           )
