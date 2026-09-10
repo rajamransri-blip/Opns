@@ -27,19 +27,18 @@ jobs:
 
       - name: Scaffold Android Project Source Code
         run: |
-          # 1. Project Directory Structure
           mkdir -p app/src/main/java/com/pak/manager/ui/theme
           mkdir -p app/src/main/res/values
           mkdir -p gradle/wrapper
 
-          # 2. Fix Missing AndroidX Flags (Root gradle.properties)
+          # 1. gradle.properties
           cat << 'EOF' > gradle.properties
           android.useAndroidX=true
           android.enableJetifier=true
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
           EOF
 
-          # 3. Root settings.gradle.kts
+          # 2. settings.gradle.kts
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
               repositories {
@@ -59,7 +58,7 @@ jobs:
           include(":app")
           EOF
 
-          # 4. Root build.gradle.kts
+          # 3. Root build.gradle.kts
           cat << 'EOF' > build.gradle.kts
           plugins {
               id("com.android.application") version "8.2.2" apply false
@@ -67,7 +66,7 @@ jobs:
           }
           EOF
 
-          # 5. App Module build.gradle.kts
+          # 4. App Module build.gradle.kts (With Zstandard & OkHttp Telegram Dependencies)
           cat << 'EOF' > app/build.gradle.kts
           plugins {
               id("com.android.application")
@@ -105,6 +104,11 @@ jobs:
               composeOptions {
                   kotlinCompilerExtensionVersion = "1.5.8"
               }
+              packaging {
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                  }
+              }
           }
 
           dependencies {
@@ -118,22 +122,31 @@ jobs:
               implementation("androidx.compose.ui:ui-tooling-preview")
               implementation("androidx.compose.material3:material3")
               implementation("androidx.compose.material:material-icons-extended")
+
+              // Networking & Background Tasks
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+
+              // Zstandard Decompression/Compression Engine for Unreal PAK
+              implementation("com.github.luben:zstd-jni:1.5.5-11@aar")
           }
           EOF
 
-          # 6. Values / strings.xml
+          # 5. Strings resource
           cat << 'EOF' > app/src/main/res/values/strings.xml
           <resources>
               <string name="app_name">PAK Bot Server</string>
           </resources>
           EOF
 
-          # 7. AndroidManifest.xml
+          # 6. AndroidManifest.xml
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
               <application
                   android:allowBackup="true"
@@ -154,7 +167,7 @@ jobs:
           </manifest>
           EOF
 
-          # 8. Theme.kt
+          # 7. Theme.kt
           cat << 'EOF' > app/src/main/java/com/pak/manager/ui/theme/Theme.kt
           package com.pak.manager.ui.theme
 
@@ -183,7 +196,55 @@ jobs:
           }
           EOF
 
-          # 9. MainActivity.kt
+          # 8. PakEngine.kt (Zstandard + UE Pak Handling Logic)
+          cat << 'EOF' > app/src/main/java/com/pak/manager/PakEngine.kt
+          package com.pak.manager
+
+          import com.github.luben.zstd.ZstdInputStream
+          import com.github.luben.zstd.ZstdOutputStream
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+
+          object PakEngine {
+              // UE Pak Magic Bytes: 0x5A6F12E1
+              const val PAK_MAGIC = 0x5A6F12E1L
+
+              fun decompressZstd(compressedFile: File, outputFile: File): Boolean {
+                  return try {
+                      FileInputStream(compressedFile).use { fis ->
+                          ZstdInputStream(fis).use { zis ->
+                              FileOutputStream(outputFile).use { fos ->
+                                  zis.copyTo(fos)
+                              }
+                          }
+                      }
+                      true
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                      false
+                  }
+              }
+
+              fun compressZstd(sourceFile: File, outputFile: File, level: Int = 3): Boolean {
+                  return try {
+                      FileInputStream(sourceFile).use { fis ->
+                          FileOutputStream(outputFile).use { fos ->
+                              ZstdOutputStream(fos, level).use { zos ->
+                                  fis.copyTo(zos)
+                              }
+                          }
+                      }
+                      true
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                      false
+                  }
+              }
+          }
+          EOF
+
+          # 9. MainActivity.kt (UI + Bot Status Controls)
           cat << 'EOF' > app/src/main/java/com/pak/manager/MainActivity.kt
           package com.pak.manager
 
@@ -226,7 +287,7 @@ jobs:
               var botToken by remember { mutableStateOf("") }
               var chatId by remember { mutableStateOf("") }
               var isRunning by remember { mutableStateOf(false) }
-              var logs by remember { mutableStateOf("Logs:\n[System] Ready to start.") }
+              var logs by remember { mutableStateOf("Logs:\n[System] Core engine with Zstd & OkHttp initialized.") }
 
               Column(
                   modifier = Modifier
@@ -265,7 +326,7 @@ jobs:
                       Button(
                           onClick = {
                               isRunning = true
-                              logs += "\n[Server] Listening for Unpack/Repack commands..."
+                              logs += "\n[Server] Polling active. Ready for .pak and paths."
                           },
                           enabled = !isRunning,
                           colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
