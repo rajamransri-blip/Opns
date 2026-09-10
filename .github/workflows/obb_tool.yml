@@ -12,7 +12,7 @@ on:
           - unpack
           - repack
       aes_key:
-        description: '(Optional) Custom AES Key agar auto-keys match na hon'
+        description: '(Optional) Custom AES Key'
         required: false
         default: ''
 
@@ -51,137 +51,144 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Inspect Tool Scripts & Execute Binaries
-        shell: powershell
+      - name: Multi-Binary Unpack & Decrypt Engine
+        shell: python
+        env:
+          ACTION_TYPE: ${{ github.event.inputs.action_type }}
+          AES_KEY: ${{ github.event.inputs.aes_key }}
         run: |
-          Write-Host "=========================================="
-          Write-Host " STEP 1: Tool Discovery & Script Analysis"
-          Write-Host "=========================================="
-          if (-not (Test-Path "original_pak")) { New-Item -ItemType Directory -Path "original_pak" }
-          if (-not (Test-Path "unpacked")) { New-Item -ItemType Directory -Path "unpacked" }
+          import os
+          import sys
+          import glob
+          import subprocess
+          import urllib.request
 
-          $quickbms = (Get-ChildItem -Recurse -Filter "quickbms_4gb_files.exe" | Select-Object -First 1).FullName
-          if (-not $quickbms) { $quickbms = (Get-ChildItem -Recurse -Filter "quickbms.exe" | Select-Object -First 1).FullName }
+          os.makedirs("original_pak", exist_ok=True)
+          os.makedirs("unpacked", exist_ok=True)
 
-          $bmsScript = (Get-ChildItem -Recurse -Filter "script.bms" | Select-Object -First 1).FullName
-          $uassetGui = (Get-ChildItem -Recurse -Filter "UAssetGUI.exe" | Select-Object -First 1).FullName
+          print("=== STEP 1: Tool & Binary Discovery ===")
+          quickbms = None
+          bms_script = None
+          uasset_gui = None
 
-          Write-Host "QuickBMS: $quickbms"
-          Write-Host "Script  : $bmsScript"
-          Write-Host "UAsset  : $uassetGui"
+          for root, _, files in os.walk("."):
+              for f in files:
+                  low = f.lower()
+                  if low == "quickbms_4gb_files.exe" and not quickbms:
+                      quickbms = os.path.abspath(os.path.join(root, f))
+                  elif low == "quickbms.exe" and not quickbms:
+                      quickbms = os.path.abspath(os.path.join(root, f))
+                  elif low == "script.bms" and not bms_script:
+                      bms_script = os.path.abspath(os.path.join(root, f))
+                  elif low == "uassetgui.exe" and not uasset_gui:
+                      uasset_gui = os.path.abspath(os.path.join(root, f))
 
-          # Print internal batch file contents for inspection
-          Get-ChildItem -Recurse -Filter "reimport*.bat" | ForEach-Object {
-              Write-Host "`n[Content of $($_.Name)]:"
-              Get-Content $_.FullName | Write-Host
-          }
+          print("QuickBMS Binary :", quickbms)
+          print("Local BMS Script:", bms_script)
+          print("UAssetGUI Binary:", uasset_gui)
 
-          Write-Host "`n=========================================="
-          Write-Host " STEP 2: Input Target Setup"
-          Write-Host "=========================================="
-          $targetPath = $null
+          print("\n=== STEP 2: Input File Detection & Merging ===")
+          parts = sorted(glob.glob("original_pak/*.part_*") or glob.glob("**/*.part_*", recursive=True))
+          target_path = None
 
-          $parts = Get-ChildItem -Path "original_pak" -File | Where-Object { $_.Name -match "\.part_\d+$" } | Sort-Object Name
-          if (-not $parts) { $parts = Get-ChildItem -Recurse -File | Where-Object { $_.Name -match "\.part_\d+$" } | Sort-Object Name }
+          if parts:
+              print(f"Found {len(parts)} split parts. Merging into original_pak/game_patch.pak...")
+              merged = os.path.abspath("original_pak/game_patch.pak")
+              with open(merged, "wb") as out_f:
+                  for p in parts:
+                      with open(p, "rb") as in_f:
+                          out_f.write(in_f.read())
+              target_path = merged
+          else:
+              candidates = glob.glob("original_pak/*.pak") + glob.glob("original_pak/*.obb")
+              if not candidates:
+                  candidates = [f for f in glob.glob("**/*", recursive=True) if f.lower().endswith((".pak", ".obb")) and "tools" not in f.lower()]
+              if candidates:
+                  target_path = os.path.abspath(candidates[0])
 
-          if ($parts.Count -gt 0) {
-              Write-Host "Merging $($parts.Count) split chunk(s)..."
-              $mergedFile = "original_pak\game_patch.pak"
-              $fs = [System.IO.File]::Create($mergedFile)
-              foreach ($p in $parts) {
-                  $bytes = [System.IO.File]::ReadAllBytes($p.FullName)
-                  $fs.Write($bytes, 0, $bytes.Length)
-              }
-              $fs.Close()
-              $targetPath = (Get-Item $mergedFile).FullName
-          } else {
-              $target = Get-ChildItem -Path "original_pak" -File | Where-Object { $_.Extension -match "\.(pak|obb)$" } | Select-Object -First 1
-              if (-not $target) { $target = Get-ChildItem -Recurse -File | Where-Object { $_.Extension -match "\.(pak|obb)$" } | Select-Object -First 1 }
-              if ($target) { $targetPath = $target.FullName }
-          }
+          if not target_path or not os.path.exists(target_path):
+              print("ERROR: Target game package not found in repo!")
+              sys.exit(1)
 
-          if (-not $targetPath -or -not (Test-Path $targetPath)) {
-              Write-Error "No game package found in repo!"
-              exit 1
-          }
-          Write-Host "Target Verified: $targetPath ($([math]::Round((Get-Item $targetPath).Length/1MB, 2)) MB)"
+          file_size_mb = os.path.getsize(target_path) / (1024 * 1024)
+          print(f"Target Confirmed: {target_path} ({file_size_mb:.2f} MB)")
 
-          Write-Host "`n=========================================="
-          Write-Host " STEP 3: Multi-Key Unpack Engine"
-          Write-Host "=========================================="
-          $action = "${{ github.event.inputs.action_type }}"
-          $extractedCount = 0
+          unpacked_dir = os.path.abspath("unpacked")
 
-          if ($action -eq "unpack") {
-              # Download updated UE4 bms script
-              $ue4Script = "ue4_pak.bms"
-              Invoke-WebRequest -Uri "https://aluigi.altervista.org/bms/unreal_tournament_4.bms" -OutFile $ue4Script -UserAgent "QuickBMS"
+          def count_files():
+              cnt = 0
+              for _, _, f in os.walk(unpacked_dir):
+                  cnt += len(f)
+              return cnt
 
-              # List of known PUBG Mobile / BGMI AES Keys to auto-try
-              $keys = @(
-                  "${{ github.event.inputs.aes_key }}".Trim(),
-                  "0x8035DAFA76249A09FD0F210452E0EF3EAF7F83D398E187EBBE52D82D6D3A0A06",
-                  "0xC7497217B27C12F6C6C8ACF8CF87BE792A62C0EEBC3DE33DF7EBCEBFF09A1208",
-                  "0xDD11E2CF20942F9E58A4633887192C2B295627E431EB9A17154E89745A1A4E7A",
-                  "0x48657820746F204153434949202D204F6E6C696E6520746F6F6C000000000000",
-                  "0x9D8C9A4A4FA082F213EED604B6E756237181685EEDA82216437617D7AA5231AF",
-                  ""
-              )
+          print("\n=== STEP 3: Executing Unpack Engine ===")
+          action = os.environ.get("ACTION_TYPE", "unpack").strip()
+          custom_key = os.environ.get("AES_KEY", "").strip()
 
-              # Filter empty entries
-              $keys = $keys | Where-Object { $_ -ne "" }
+          if action == "unpack":
+              # 1. Try local script.bms
+              print("[Method 1] Running with local script.bms...")
+              subprocess.run([quickbms, "-o", "-y", "-e", bms_script, target_path, unpacked_dir], capture_output=True)
 
-              # 1. Try local script.bms first
-              Write-Host "[1/3] Trying with local script.bms..."
-              & "$quickbms" -o -y -e "$bmsScript" "$targetPath" "unpacked" 2>$null
-              $extractedCount = (Get-ChildItem -Path "unpacked" -Recurse -File).Count
+              # 2. If 0 files, switch to Unreal Engine 4 script & test known keys
+              if count_files() == 0:
+                  print("[Method 2] Switching to Unreal Engine 4 PAK Decryption...")
+                  ue4_script = os.path.abspath("ue4_pak.bms")
+                  try:
+                      urllib.request.urlretrieve("https://aluigi.altervista.org/bms/unreal_tournament_4.bms", ue4_script)
+                  except Exception as ex:
+                      print("Script download warning:", ex)
 
-              # 2. If 0 files, iterate through AES keys with UE4 script
-              if ($extractedCount -eq 0) {
-                  Write-Host "`n[2/3] Local script returned 0 files. Auto-testing AES keys on UE4 Engine..."
-                  foreach ($k in $keys) {
-                      Write-Host "-> Testing Key: $k"
-                      & "$quickbms" -o -y -e -s "set KEY string $k" "$ue4Script" "$targetPath" "unpacked"
-                      $extractedCount = (Get-ChildItem -Path "unpacked" -Recurse -File).Count
-                      if ($extractedCount -gt 0) {
-                          Write-Host "`n✓ SUCCESS! Key matched: $k ($extractedCount files extracted)"
+                  keys_to_test = [
+                      custom_key,
+                      "0x8035DAFA76249A09FD0F210452E0EF3EAF7F83D398E187EBBE52D82D6D3A0A06",
+                      "0xC7497217B27C12F6C6C8ACF8CF87BE792A62C0EEBC3DE33DF7EBCEBFF09A1208",
+                      "0xDD11E2CF20942F9E58A4633887192C2B295627E431EB9A17154E89745A1A4E7A",
+                      "0x48657820746F204153434949202D204F6E6C696E6520746F6F6C000000000000",
+                      "0x9D8C9A4A4FA082F213EED604B6E756237181685EEDA82216437617D7AA5231AF"
+                  ]
+                  keys_to_test = [k for k in keys_to_test if k]
+
+                  for k in keys_to_test:
+                      print(f"Testing Key: {k[:16]}...")
+                      p = subprocess.Popen(
+                          [quickbms, "-o", "-y", "-e", ue4_script, target_path, unpacked_dir],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                      )
+                      # Send key directly to stdin prompt
+                      p.communicate(input=(k + "\n").encode(), timeout=60)
+                      if count_files() > 0:
+                          print(f"SUCCESS: Decrypted using key {k[:16]}...!")
                           break
-                      }
-                  }
-              }
 
-              # 3. Fallback: 7-Zip Container extraction
-              if ($extractedCount -eq 0) {
-                  Write-Host "`n[3/3] Trying 7-Zip extraction..."
-                  7z x "$targetPath" "-ounpacked" -y | Out-Null
-                  $extractedCount = (Get-ChildItem -Path "unpacked" -Recurse -File).Count
-              }
-          } else {
-              # Repack logic
-              Write-Host "Executing Repack via QuickBMS Reimport..."
-              & "$quickbms" -r -w -y -e "$bmsScript" "$targetPath" "unpacked"
-              $extractedCount = 1
-          }
+              # 3. Fallback: 7-Zip Container
+              if count_files() == 0:
+                  print("[Method 3] Trying 7-Zip extraction...")
+                  subprocess.run(["7z", "x", target_path, f"-o{unpacked_dir}", "-y"], capture_output=True)
+          else:
+              print("Executing Repack with QuickBMS...")
+              subprocess.run([quickbms, "-r", "-w", "-y", "-e", bms_script, target_path, unpacked_dir], capture_output=True)
 
-          Write-Host "`nTotal Extracted Files: $extractedCount"
-          if ($extractedCount -eq 0) {
-              Write-Error "Extraction fail ho gayi! Sahi AES key provide karein."
-              exit 1
-          }
+          total_files = count_files()
+          print(f"\nTotal Extracted Files Count: {total_files}")
+          if total_files == 0:
+              print("ERROR: Extraction returned 0 files. Check AES Key or format.")
+              sys.exit(1)
 
-          Write-Host "`n=========================================="
-          Write-Host " STEP 4: Processing .uasset with UAssetGUI"
-          Write-Host "=========================================="
-          if ($uassetGui -and (Test-Path $uassetGui)) {
-              $uassets = Get-ChildItem -Path "unpacked" -Recurse -Filter "*.uasset"
-              Write-Host "Total .uasset files found: $($uassets.Count)"
-              foreach ($u in ($uassets | Select-Object -First 10)) {
-                  Write-Host "Exporting to JSON: $($u.Name)"
-                  try {
-                      & "$uassetGui" "$($u.FullName)" "$($u.FullName).json" 2>$null
-                  } catch {}
-              }
-          }
+          # Optional UAssetGUI Export
+          if uasset_gui and os.path.exists(uasset_gui):
+              print("\n=== STEP 4: Processing .uasset with UAssetGUI ===")
+              uassets = []
+              for r, _, fl in os.walk(unpacked_dir):
+                  for f in fl:
+                      if f.lower().endswith(".uasset"):
+                          uassets.append(os.path.join(r, f))
+              print(f"Found {len(uassets)} .uasset files.")
+              for u in uassets[:5]:
+                  try:
+                      subprocess.run([uasset_gui, u, u + ".json"], timeout=10, capture_output=True)
+                  except Exception:
+                      pass
 
       - name: Commit and Push unpacked files to Repo
         shell: bash
