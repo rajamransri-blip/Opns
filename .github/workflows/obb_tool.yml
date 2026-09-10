@@ -123,7 +123,7 @@ jobs:
               implementation("androidx.compose.material3:material3")
               implementation("androidx.compose.material:material-icons-extended")
 
-              // Live Telegram Networking & Background Coroutines
+              // OkHttp Networking
               implementation("com.squareup.okhttp3:okhttp:4.12.0")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
@@ -200,7 +200,7 @@ jobs:
           }
           EOF
 
-          # 8. PakEngine.kt (Chunk & Header-aware Parser)
+          # 8. PakEngine.kt (Zstd Decompressed Index + Flexible Search)
           cat << 'EOF' > app/src/main/java/com/pak/manager/PakEngine.kt
           package com.pak.manager
 
@@ -244,10 +244,26 @@ jobs:
                           if (indexOffset <= 0 || indexOffset >= len) return entries
 
                           raf.seek(indexOffset)
-                          val indexBuf = ByteArray(indexSize.toInt())
-                          raf.readFully(indexBuf)
-                          val ib = ByteBuffer.wrap(indexBuf).order(ByteOrder.LITTLE_ENDIAN)
+                          val rawIndex = ByteArray(indexSize.toInt())
+                          raf.readFully(rawIndex)
 
+                          // Handle Zstandard compressed Index Table
+                          val indexBytes: ByteArray = try {
+                              val decompressedSize = Zstd.decompressedSize(rawIndex)
+                              if (decompressedSize > 0) {
+                                  val out = ByteArray(decompressedSize.toInt())
+                                  Zstd.decompress(out, rawIndex)
+                                  out
+                              } else {
+                                  rawIndex
+                              }
+                          } catch (e: Exception) {
+                              rawIndex
+                          }
+
+                          val ib = ByteBuffer.wrap(indexBytes).order(ByteOrder.LITTLE_ENDIAN)
+
+                          // Mount point string
                           val mountLen = ib.int
                           if (mountLen in 1..511) {
                               ib.position(ib.position() + mountLen)
@@ -255,9 +271,10 @@ jobs:
 
                           val numEntries = ib.int
                           for (i in 0 until numEntries) {
+                              if (ib.remaining() < 8) break
                               val entryPos = ib.position()
                               val pathLen = ib.int
-                              if (pathLen <= 0 || pathLen > 1024) break
+                              if (pathLen <= 0 || pathLen > 1024 || pathLen > ib.remaining()) break
                               val pathBytes = ByteArray(pathLen)
                               ib.get(pathBytes)
                               val name = String(pathBytes).trimEnd('\u0000')
@@ -295,14 +312,21 @@ jobs:
 
               fun extractMatching(
                   pakFile: File,
-                  filterPath: String,
+                  searchQuery: String,
                   outDir: File,
                   onProgress: (Int) -> Unit
               ): List<File> {
                   val result = mutableListOf<File>()
                   val entries = parseIndex(pakFile)
-                  val query = filterPath.trim().trim('/').replace('\\', '/')
-                  val matches = entries.filter { it.path.replace('\\', '/').contains(query, ignoreCase = true) }
+
+                  // Sanitize search query: remove slashes and dots for flexible match
+                  val cleanQuery = searchQuery.trim().replace("\\", "/").trim('/')
+                  
+                  val matches = entries.filter { entry ->
+                      val cleanPath = entry.path.replace("\\", "/")
+                      cleanPath.contains(cleanQuery, ignoreCase = true) ||
+                      entry.path.endsWith(cleanQuery, ignoreCase = true)
+                  }
 
                   if (matches.isEmpty()) return result
                   outDir.mkdirs()
@@ -348,15 +372,13 @@ jobs:
                           val newOffset = raf.length()
                           raf.seek(newOffset)
 
-                          // Entry Header
                           raf.writeLong(newOffset)
                           raf.writeLong(compressed.size.toLong())
                           raf.writeLong(rawBytes.size.toLong())
-                          raf.writeInt(1) // Zstd
+                          raf.writeInt(1)
                           raf.write(ByteArray(20))
                           raf.write(compressed)
 
-                          // Update Index Table pointer
                           raf.seek(targetEntry.structOffset + 4 + targetEntry.path.length + 1)
                           raf.writeLong(newOffset)
                           raf.writeLong(compressed.size.toLong())
@@ -400,18 +422,18 @@ jobs:
               private var lastOffset = 0L
               private val scope = CoroutineScope(Dispatchers.IO + Job())
 
-              private var currentStep = "IDLE" // WAIT_UNPACK_PAK, WAIT_UNPACK_PATH, WAIT_REPACK_PAK, WAIT_REPACK_FILE
+              private var currentStep = "IDLE"
               private var savedPak: File? = null
 
               fun start() {
                   isRunning = true
                   scope.launch {
-                      sendMsg("🟢 *Server Bot is Live & Listening!*\nCommands:\n/unpack - Extract specific folder/file\n/repack - Replace file in PAK")
+                      sendMsg("🟢 *Server Bot Connected!*\nCommands:\n/unpack - Extract matching folder or file extension\n/repack - Replace file in PAK")
                       while (isRunning) {
                           try {
                               poll()
                           } catch (e: Exception) {
-                              delay(2500)
+                              delay(2000)
                           }
                       }
                   }
@@ -461,7 +483,7 @@ jobs:
                   when {
                       text.startsWith("/unpack") -> {
                           currentStep = "WAIT_UNPACK_PAK"
-                          sendMsg("📦 Mode: *UNPACK*\nPlease send your `.pak` file as document:")
+                          sendMsg("📦 Mode: *UNPACK*\nPlease send your `.pak` file:")
                       }
                       text.startsWith("/repack") -> {
                           currentStep = "WAIT_REPACK_PAK"
@@ -485,12 +507,12 @@ jobs:
                               if (downloaded != null) {
                                   savedPak = downloaded
                                   currentStep = "WAIT_UNPACK_PATH"
-                                  editMsg(
+                                  editText(
                                       msgId,
-                                      "✅ *Downloaded:* `$fileName`\n\n👉 Send target folder or file path:\n(e.g. `/ShadowTrackerExtra/Content/BluePrints/Core/` or `.lua` path)"
+                                      "✅ *Downloaded:* `$fileName`\n\n👉 Send target folder or search path:\n(Examples: `BluePrints/Core`, `.lua`, or `BP_PlayerPawn.uasset`)"
                                   )
                               } else {
-                                  editMsg(msgId, "❌ Download failed.")
+                                  editText(msgId, "❌ Download failed.")
                               }
                           }
                           "WAIT_REPACK_PAK" -> {
@@ -499,23 +521,23 @@ jobs:
                               if (downloaded != null) {
                                   savedPak = downloaded
                                   currentStep = "WAIT_REPACK_FILE"
-                                  editMsg(msgId, "✅ Base PAK saved.\n\n👉 Now upload the file you want to replace (`.uasset`, `.uexp`, `.lua`):")
+                                  editText(msgId, "✅ Base PAK saved.\n\n👉 Now upload the replacement file (`.uasset`, `.uexp`, `.lua`):")
                               } else {
-                                  editMsg(msgId, "❌ Download failed.")
+                                  editText(msgId, "❌ Download failed.")
                               }
                           }
                           "WAIT_REPACK_FILE" -> {
                               val msgId = sendMsg("📥 Downloading replacement: `$fileName`...")
                               val downloaded = downloadFile(fileId, fileName)
                               if (downloaded != null && savedPak != null) {
-                                  editMsg(msgId, "⚙️ Repacking into `.pak`...\n`[████████░░] 80%`")
+                                  editText(msgId, "⚙️ Repacking into `.pak`...\n`[████████░░] 80%`")
                                   val outPak = File(context.cacheDir, "repacked_${savedPak!!.name}")
                                   val ok = PakEngine.repackSingle(savedPak!!, downloaded, outPak)
                                   if (ok) {
-                                      editMsg(msgId, "✅ *Repack Complete!* Uploading...")
+                                      editText(msgId, "✅ *Repack Complete!* Uploading...")
                                       uploadFile(outPak, "Repacked: ${outPak.name}")
                                   } else {
-                                      editMsg(msgId, "❌ Target `$fileName` not found inside PAK index.")
+                                      editText(msgId, "❌ Target `$fileName` not found inside PAK index.")
                                   }
                                   currentStep = "IDLE"
                               }
@@ -531,18 +553,18 @@ jobs:
                   }
 
                   scope.launch {
-                      val msgId = sendMsg("🔍 Scanning index and unpacking...\n`[░░░░░░░░░░] 0%`")
+                      val msgId = sendMsg("🔍 Scanning Zstd index and extracting files matching `$targetPath`...\n`[░░░░░░░░░░] 0%`")
                       val outDir = File(context.cacheDir, "extracted_${System.currentTimeMillis()}")
 
                       val files = PakEngine.extractMatching(pak, targetPath, outDir) { p ->
                           val bar = "[" + "█".repeat(p / 10) + "░".repeat(10 - (p / 10)) + "]"
-                          editMsg(msgId, "⚙️ Unpacking `$targetPath`\n`$bar` $p%")
+                          editText(msgId, "⚙️ Unpacking `$targetPath`\n`$bar` $p%")
                       }
 
                       if (files.isEmpty()) {
-                          editMsg(msgId, "❌ No files matched path:\n`$targetPath`")
+                          editText(msgId, "❌ No files matched path:\n`$targetPath`\n\nTry sending part of the path (e.g. `BluePrints` or `.uasset` or `.lua`).")
                       } else {
-                          editMsg(msgId, "✅ Extracted *${files.size}* file(s)! Uploading to chat...")
+                          editText(msgId, "✅ Extracted *${files.size}* real file(s)! Uploading to chat...")
                           for (f in files) {
                               uploadFile(f, "Name: ${f.name}\nSize: ${f.length()} bytes")
                           }
@@ -612,7 +634,7 @@ jobs:
                   }
               }
 
-              private fun editMsg(messageId: Long, text: String) {
+              private fun editText(messageId: Long, text: String) {
                   if (messageId == 0L) return
                   try {
                       val json = JSONObject().apply {
@@ -830,7 +852,7 @@ jobs:
                           )
                           Spacer(modifier = Modifier.height(8.dp))
                           Text(
-                              text = "• Foreground Daemon: Persistent\n• Real File Matching: Enabled (.uasset, .uexp, .lua)\n• Index Offset & Size Reader: Active\n• Dynamic Live Bar: Enabled",
+                              text = "• Zstandard Decompressed Index: Enabled\n• Substring Search: Active (.uasset, .uexp, .lua)\n• Real File Stream Extractor: Ready\n• Live Edit Progress Bar: Active",
                               fontSize = 13.sp,
                               color = Color.LightGray
                           )
