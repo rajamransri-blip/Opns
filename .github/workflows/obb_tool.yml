@@ -1,0 +1,138 @@
+name: OBB & PAK Auto Unpacker
+
+on:
+  workflow_dispatch:
+    inputs:
+      action_type:
+        description: 'Action'
+        required: true
+        default: 'unpack'
+        type: choice
+        options:
+          - unpack
+          - repack
+
+permissions:
+  contents: write
+
+jobs:
+  fix-folder-names:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Linux
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Normalize Folder Names
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          python3 -c '
+          import os, subprocess
+          changed = False
+          for item in os.listdir("."):
+              if os.path.isdir(item) and (item.endswith(" ") or "PC" in item):
+                  res = subprocess.run(["git", "mv", item, "tools"])
+                  if res.returncode == 0:
+                      changed = True
+          if changed:
+              subprocess.run(["git", "commit", "-m", "Clean tool folder [skip ci]"])
+              subprocess.run(["git", "push", "origin", "HEAD:main"])
+          '
+
+  process:
+    needs: fix-folder-names
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Auto-Detect, Merge & Extract
+        shell: powershell
+        run: |
+          Write-Host "=== STEP 1: Setting up Directories ==="
+          if (-not (Test-Path "original_pak")) { New-Item -ItemType Directory -Path "original_pak" }
+          if (-not (Test-Path "unpacked")) { New-Item -ItemType Directory -Path "unpacked" }
+
+          Write-Host "`n=== STEP 2: Locating Tools and Script ==="
+          $bmsScript = (Get-ChildItem -Recurse -Filter "script.bms" | Select-Object -First 1).FullName
+          $quickbms = (Get-ChildItem -Recurse -Filter "quickbms_4gb_files.exe" | Select-Object -First 1).FullName
+          if (-not $quickbms) {
+              $quickbms = (Get-ChildItem -Recurse -Filter "quickbms.exe" | Select-Object -First 1).FullName
+          }
+          Write-Host "QuickBMS: $quickbms"
+          Write-Host "Script: $bmsScript"
+
+          Write-Host "`n=== STEP 3: Detecting File or Split Chunks ==="
+          $targetPath = $null
+
+          # 1. Check if file was split into parts (.part_000, .part_001)
+          $parts = Get-ChildItem -Recurse -File | Where-Object { $_.Name -match "\.part_\d+$" } | Sort-Object Name
+          if ($parts.Count -gt 0) {
+              Write-Host "Detected $($parts.Count) split part(s). Auto-merging..."
+              $mergedFile = "original_pak\recombined_game.pak"
+              $fs = [System.IO.File]::Create($mergedFile)
+              foreach ($p in $parts) {
+                  Write-Host "Joining: $($p.Name) ($([math]::Round($p.Length/1MB, 2)) MB)"
+                  $bytes = [System.IO.File]::ReadAllBytes($p.FullName)
+                  $fs.Write($bytes, 0, $bytes.Length)
+              }
+              $fs.Close()
+              $targetPath = (Get-Item $mergedFile).FullName
+          } else {
+              # 2. Check for direct .pak or .obb
+              $target = Get-ChildItem -Path "original_pak" -File | Where-Object { $_.Extension -match "\.(pak|obb)$" } | Select-Object -First 1
+              if (-not $target) {
+                  $target = Get-ChildItem -Recurse -File | Where-Object { $_.Extension -match "\.(pak|obb)$" } | Select-Object -First 1
+              }
+              if ($target) {
+                  $targetPath = $target.FullName
+              }
+          }
+
+          if (-not $targetPath -or -not (Test-Path $targetPath)) {
+              Write-Error "Error: Repository me koi file (.pak, .obb, ya .part_) nahi mili!"
+              Write-Host "Repository contents:"
+              Get-ChildItem -Recurse -File | ForEach-Object { Write-Host " - " $_.FullName.Replace("$PWD\", "") }
+              exit 1
+          }
+
+          Write-Host "`n>> Target Confirmed: $targetPath ($([math]::Round((Get-Item $targetPath).Length/1MB, 2)) MB)"
+
+          $action = "${{ github.event.inputs.action_type }}"
+          Write-Host "`n=== STEP 4: Executing $action ==="
+          if ($action -eq "unpack") {
+              & "$quickbms" -o "$bmsScript" "$targetPath" "unpacked"
+          } else {
+              & "$quickbms" -r -w "$bmsScript" "$targetPath" "unpacked"
+          }
+
+      - name: Commit and Push unpacked files to Repo
+        shell: powershell
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git pull origin main --rebase
+          git add unpacked/
+
+          git diff --staged --quiet
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "Unpacked folder ko repo me commit aur push kiya ja raha hai..."
+              git commit -m "Auto-unpacked files committed [skip ci]"
+              git push origin HEAD:main
+              Write-Host "✓ Saari extracted files repo ke 'unpacked/' folder me push ho gayi hain!"
+          } else {
+              Write-Host "unpacked/ folder me koi nayi changes nahi hain."
+          }
+
+      - name: Backup Artifact Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-unpacked-files
+          path: unpacked/
+          retention-days: 2
