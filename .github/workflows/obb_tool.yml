@@ -1,4 +1,4 @@
-name: Generate Source & Build APK
+name: Build Android PAK Bot APK
 
 on:
   push:
@@ -8,8 +8,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  generate-and-build:
-    name: Scaffold App & Build APK
+  build-apk:
+    name: Build Debug APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -20,12 +20,12 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Auto Accept Android Licenses
+      - name: Auto Accept Android SDK Licenses
         run: |
           mkdir -p "$ANDROID_HOME/licenses" || true
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
 
-      - name: Scaffold Android Project Source Code
+      - name: Scaffold Project Source Files
         run: |
           mkdir -p app/src/main/java/com/pak/manager/ui/theme
           mkdir -p app/src/main/res/values
@@ -66,7 +66,7 @@ jobs:
           }
           EOF
 
-          # 4. App Module build.gradle.kts
+          # 4. app/build.gradle.kts
           cat << 'EOF' > app/build.gradle.kts
           plugins {
               id("com.android.application")
@@ -123,11 +123,11 @@ jobs:
               implementation("androidx.compose.material3:material3")
               implementation("androidx.compose.material:material-icons-extended")
 
-              // OkHttp & Coroutines
+              // Live Telegram Networking & Background Coroutines
               implementation("com.squareup.okhttp3:okhttp:4.12.0")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 
-              // Native Zstandard
+              // Native Zstandard Compression Engine
               implementation("com.github.luben:zstd-jni:1.5.5-11@aar")
           }
           EOF
@@ -139,7 +139,7 @@ jobs:
           </resources>
           EOF
 
-          # 6. AndroidManifest.xml (Foreground Service Declared)
+          # 6. AndroidManifest.xml
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -200,117 +200,178 @@ jobs:
           }
           EOF
 
-          # 8. PakEngine.kt (Chunk Processor & Extractor)
+          # 8. PakEngine.kt (Chunk & Header-aware Parser)
           cat << 'EOF' > app/src/main/java/com/pak/manager/PakEngine.kt
           package com.pak.manager
 
-          import com.github.luben.zstd.ZstdInputStream
-          import com.github.luben.zstd.ZstdOutputStream
-          import java.io.*
+          import com.github.luben.zstd.Zstd
+          import java.io.File
+          import java.io.RandomAccessFile
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+
+          data class PakEntry(
+              val path: String,
+              val offset: Long,
+              val size: Long,
+              val uncompressedSize: Long,
+              val compressionMethod: Int,
+              val structOffset: Long
+          )
 
           object PakEngine {
-              const val CHUNK_SIZE = 64 * 1024
+              private const val PAK_MAGIC = 0x5A6F12E1L
 
-              fun extractFiles(
-                  pakFile: File,
-                  targetPath: String,
-                  outputDir: File,
-                  onProgress: (Int) -> Unit
-              ): List<File> {
-                  outputDir.mkdirs()
-                  val extracted = mutableListOf<File>()
+              fun parseIndex(pakFile: File): List<PakEntry> {
+                  val entries = mutableListOf<PakEntry>()
+                  if (!pakFile.exists() || pakFile.length() < 204) return entries
 
-                  // Simplified extraction simulator matching chunk buffers
-                  val totalSteps = 10
-                  for (i in 1..totalSteps) {
-                      Thread.sleep(300) // Processing chunk
-                      onProgress(i * 10)
-                  }
-
-                  val resultFile = File(outputDir, "extracted_data.bin")
                   try {
-                      FileInputStream(pakFile).use { fis ->
-                          ZstdInputStream(fis).use { zis ->
-                              FileOutputStream(resultFile).use { fos ->
-                                  val buf = ByteArray(CHUNK_SIZE)
-                                  var r: Int
-                                  while (zis.read(buf).also { r = it } != -1) {
-                                      fos.write(buf, 0, r)
-                                  }
+                      RandomAccessFile(pakFile, "r").use { raf ->
+                          val len = raf.length()
+                          raf.seek(maxOf(0L, len - 204))
+                          val footer = ByteArray(204)
+                          raf.readFully(footer)
+                          val bb = ByteBuffer.wrap(footer).order(ByteOrder.LITTLE_ENDIAN)
+
+                          val magic = bb.int.toLong() and 0xFFFFFFFFL
+                          if (magic != PAK_MAGIC) return entries
+
+                          val version = bb.int
+                          val indexOffset = bb.long
+                          val indexSize = bb.long
+
+                          if (indexOffset <= 0 || indexOffset >= len) return entries
+
+                          raf.seek(indexOffset)
+                          val indexBuf = ByteArray(indexSize.toInt())
+                          raf.readFully(indexBuf)
+                          val ib = ByteBuffer.wrap(indexBuf).order(ByteOrder.LITTLE_ENDIAN)
+
+                          val mountLen = ib.int
+                          if (mountLen in 1..511) {
+                              ib.position(ib.position() + mountLen)
+                          }
+
+                          val numEntries = ib.int
+                          for (i in 0 until numEntries) {
+                              val entryPos = ib.position()
+                              val pathLen = ib.int
+                              if (pathLen <= 0 || pathLen > 1024) break
+                              val pathBytes = ByteArray(pathLen)
+                              ib.get(pathBytes)
+                              val name = String(pathBytes).trimEnd('\u0000')
+
+                              val fOffset = ib.long
+                              val compSize = ib.long
+                              val uncompSize = ib.long
+                              val method = ib.int
+
+                              ib.position(ib.position() + 20) // Skip SHA1
+                              if (method != 0) {
+                                  val blocks = ib.int
+                                  ib.position(ib.position() + (blocks * 16))
                               }
+                              ib.get() // isEncrypted
+                              val blockSize = ib.int
+
+                              entries.add(
+                                  PakEntry(
+                                      path = name,
+                                      offset = fOffset,
+                                      size = compSize,
+                                      uncompressedSize = uncompSize,
+                                      compressionMethod = method,
+                                      structOffset = indexOffset + entryPos
+                                  )
+                              )
                           }
                       }
-                      extracted.add(resultFile)
                   } catch (e: Exception) {
-                      // Fallback copy if not pure compressed stream
-                      val directCopy = File(outputDir, "extracted_chunk.raw")
-                      pakFile.copyTo(directCopy, overwrite = true)
-                      extracted.add(directCopy)
+                      e.printStackTrace()
                   }
-                  return extracted
+                  return entries
               }
-          }
-          EOF
 
-          # 9. BotForegroundService.kt (Keep Alive in Background)
-          cat << 'EOF' > app/src/main/java/com/pak/manager/BotForegroundService.kt
-          package com.pak.manager
+              fun extractMatching(
+                  pakFile: File,
+                  filterPath: String,
+                  outDir: File,
+                  onProgress: (Int) -> Unit
+              ): List<File> {
+                  val result = mutableListOf<File>()
+                  val entries = parseIndex(pakFile)
+                  val query = filterPath.trim().trim('/').replace('\\', '/')
+                  val matches = entries.filter { it.path.replace('\\', '/').contains(query, ignoreCase = true) }
 
-          import android.app.*
-          import android.content.Intent
-          import android.os.Build
-          import android.os.IBinder
-          import androidx.core.app.NotificationCompat
+                  if (matches.isEmpty()) return result
+                  outDir.mkdirs()
 
-          class BotForegroundService : Service() {
-              private var botEngine: TelegramEngine? = null
+                  RandomAccessFile(pakFile, "r").use { raf ->
+                      matches.forEachIndexed { idx, entry ->
+                          val pureName = entry.path.substringAfterLast('/').substringAfterLast('\\')
+                          val target = File(outDir, pureName)
 
-              override fun onBind(intent: Intent?): IBinder? = null
+                          val headerSize = if (entry.compressionMethod != 0) 56 else 48
+                          raf.seek(entry.offset + headerSize)
 
-              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  createNotificationChannel()
-                  val notification = NotificationCompat.Builder(this, "pak_bot_channel")
-                      .setContentTitle("PAK Manager Service")
-                      .setContentText("Listening for Telegram Unpack/Repack tasks...")
-                      .setSmallIcon(android.R.drawable.stat_notify_sync)
-                      .setOngoing(true)
-                      .build()
+                          val raw = ByteArray(entry.size.toInt())
+                          raf.readFully(raw)
 
-                  startForeground(101, notification)
+                          if (entry.compressionMethod != 0 && entry.uncompressedSize > 0) {
+                              val dec = ByteArray(entry.uncompressedSize.toInt())
+                              Zstd.decompress(dec, raw)
+                              target.writeBytes(dec)
+                          } else {
+                              target.writeBytes(raw)
+                          }
 
-                  val token = intent?.getStringExtra("TOKEN") ?: ""
-                  val chatId = intent?.getStringExtra("CHAT_ID") ?: ""
-
-                  if (botEngine == null && token.isNotEmpty()) {
-                      botEngine = TelegramEngine(this, token, chatId) { log ->
-                          // Internal logging
+                          result.add(target)
+                          val progress = ((idx + 1) * 100) / matches.size
+                          onProgress(progress)
                       }
-                      botEngine?.start()
                   }
-
-                  return START_STICKY
+                  return result
               }
 
-              override fun onDestroy() {
-                  botEngine?.stop()
-                  super.onDestroy()
-              }
+              fun repackSingle(basePak: File, replacementFile: File, outPak: File): Boolean {
+                  return try {
+                      basePak.copyTo(outPak, overwrite = true)
+                      val entries = parseIndex(outPak)
+                      val targetEntry = entries.find { it.path.endsWith(replacementFile.name, ignoreCase = true) }
+                          ?: return false
 
-              private fun createNotificationChannel() {
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      val chan = NotificationChannel(
-                          "pak_bot_channel",
-                          "PAK Server Channel",
-                          NotificationManager.IMPORTANCE_LOW
-                      )
-                      val manager = getSystemService(NotificationManager::class.java)
-                      manager?.createNotificationChannel(chan)
+                      val rawBytes = replacementFile.readBytes()
+                      val compressed = Zstd.compress(rawBytes, 3)
+
+                      RandomAccessFile(outPak, "rw").use { raf ->
+                          val newOffset = raf.length()
+                          raf.seek(newOffset)
+
+                          // Entry Header
+                          raf.writeLong(newOffset)
+                          raf.writeLong(compressed.size.toLong())
+                          raf.writeLong(rawBytes.size.toLong())
+                          raf.writeInt(1) // Zstd
+                          raf.write(ByteArray(20))
+                          raf.write(compressed)
+
+                          // Update Index Table pointer
+                          raf.seek(targetEntry.structOffset + 4 + targetEntry.path.length + 1)
+                          raf.writeLong(newOffset)
+                          raf.writeLong(compressed.size.toLong())
+                          raf.writeLong(rawBytes.size.toLong())
+                      }
+                      true
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                      false
                   }
               }
           }
           EOF
 
-          # 10. TelegramEngine.kt (State Engine + Document Download + Live Progress Bar)
+          # 9. TelegramEngine.kt
           cat << 'EOF' > app/src/main/java/com/pak/manager/TelegramEngine.kt
           package com.pak.manager
 
@@ -328,8 +389,7 @@ jobs:
           class TelegramEngine(
               private val context: Context,
               private val token: String,
-              private val allowedChatId: String,
-              private val onLog: (String) -> Unit
+              private val adminChatId: String
           ) {
               private val client = OkHttpClient.Builder()
                   .connectTimeout(60, TimeUnit.SECONDS)
@@ -337,23 +397,21 @@ jobs:
                   .build()
 
               private var isRunning = false
-              private var lastUpdateId = 0L
+              private var lastOffset = 0L
               private val scope = CoroutineScope(Dispatchers.IO + Job())
 
-              private var currentMode = "IDLE" // IDLE, WAIT_PAK, WAIT_PATH, WAIT_REPACK
-              private var cachedPakFile: File? = null
+              private var currentStep = "IDLE" // WAIT_UNPACK_PAK, WAIT_UNPACK_PATH, WAIT_REPACK_PAK, WAIT_REPACK_FILE
+              private var savedPak: File? = null
 
               fun start() {
                   isRunning = true
-                  onLog("[Server] Long Polling started.")
                   scope.launch {
-                      sendText("🚀 *Server is Online & Connected!*\nSend /unpack to start.")
+                      sendMsg("🟢 *Server Bot is Live & Listening!*\nCommands:\n/unpack - Extract specific folder/file\n/repack - Replace file in PAK")
                       while (isRunning) {
                           try {
                               poll()
                           } catch (e: Exception) {
-                              onLog("[Polling Error] ${e.message}")
-                              delay(2000)
+                              delay(2500)
                           }
                       }
                   }
@@ -365,40 +423,35 @@ jobs:
               }
 
               private fun poll() {
-                  val url = "https://api.telegram.org/bot$token/getUpdates?offset=${lastUpdateId + 1}&timeout=25"
+                  val url = "https://api.telegram.org/bot$token/getUpdates?offset=${lastOffset + 1}&timeout=25"
                   val request = Request.Builder().url(url).build()
 
                   client.newCall(request).execute().use { resp ->
                       if (!resp.isSuccessful) return
-                      val body = resp.body?.string() ?: return
-                      val json = JSONObject(body)
+                      val res = resp.body?.string() ?: return
+                      val json = JSONObject(res)
                       if (!json.optBoolean("ok")) return
 
-                      val results = json.optJSONArray("result") ?: return
-                      for (i in 0 until results.length()) {
-                          val item = results.getJSONObject(i)
-                          lastUpdateId = item.optLong("update_id")
+                      val updates = json.optJSONArray("result") ?: return
+                      for (i in 0 until updates.length()) {
+                          val u = updates.getJSONObject(i)
+                          lastOffset = u.optLong("update_id")
 
-                          if (!item.has("message")) continue
-                          val msg = item.getJSONObject("message")
-                          val chatObj = msg.getJSONObject("chat")
-                          val chatId = chatObj.optLong("id").toString()
+                          if (!u.has("message")) continue
+                          val msg = u.getJSONObject("message")
+                          val chat = msg.getJSONObject("chat").optLong("id").toString()
+                          if (chat != adminChatId) continue
 
-                          if (chatId != allowedChatId) continue
-
-                          // 1. Check Document Upload (.pak)
                           if (msg.has("document")) {
                               val doc = msg.getJSONObject("document")
-                              val fileId = doc.getString("file_id")
-                              val fileName = doc.optString("file_name", "target.pak")
-                              handleIncomingDocument(fileId, fileName)
+                              val fId = doc.getString("file_id")
+                              val fName = doc.optString("file_name", "archive.pak")
+                              handleDoc(fId, fName)
                               continue
                           }
 
-                          // 2. Check Text Command or Path Input
                           if (msg.has("text")) {
-                              val text = msg.getString("text").trim()
-                              handleText(text)
+                              handleText(msg.getString("text").trim())
                           }
                       }
                   }
@@ -407,109 +460,129 @@ jobs:
               private fun handleText(text: String) {
                   when {
                       text.startsWith("/unpack") -> {
-                          currentMode = "WAIT_PAK"
-                          sendText("📦 Mode set to *UNPACK*.\n\nPlease upload your `.pak` file now:")
+                          currentStep = "WAIT_UNPACK_PAK"
+                          sendMsg("📦 Mode: *UNPACK*\nPlease send your `.pak` file as document:")
                       }
                       text.startsWith("/repack") -> {
-                          currentMode = "WAIT_REPACK"
-                          sendText("🛠 Mode set to *REPACK*.\n\nUpload target file to repack:")
+                          currentStep = "WAIT_REPACK_PAK"
+                          sendMsg("🛠 Mode: *REPACK*\nStep 1: Upload base `.pak` file:")
                       }
-                      currentMode == "WAIT_PATH" -> {
-                          startUnpackProcess(text)
+                      currentStep == "WAIT_UNPACK_PATH" -> {
+                          executeUnpack(text)
                       }
                       else -> {
-                          sendText("Send /unpack to start extraction or /repack to pack.")
+                          sendMsg("Active Options:\n• /unpack (Extract files)\n• /repack (Replace assets)")
                       }
                   }
               }
 
-              private fun handleIncomingDocument(fileId: String, fileName: String) {
+              private fun handleDoc(fileId: String, fileName: String) {
                   scope.launch {
-                      val progressMsgId = sendText("📥 *Downloading:* `$fileName`...")
-
-                      val downloaded = downloadTelegramFile(fileId, fileName)
-                      if (downloaded != null && downloaded.exists()) {
-                          cachedPakFile = downloaded
-                          currentMode = "WAIT_PATH"
-                          editText(
-                              progressMsgId,
-                              "✅ *File Downloaded successfully!*\nFile: `$fileName`\n\n👉 Now enter target file path:\n(e.g. `/game_patch_4.5.0/ShadowTrackerExtra/Content/BluePrints/Core/`)"
-                          )
-                      } else {
-                          editText(progressMsgId, "❌ Download failed or file exceeds Bot API limit.")
+                      when (currentStep) {
+                          "WAIT_UNPACK_PAK" -> {
+                              val msgId = sendMsg("📥 Downloading `.pak`: `$fileName`...")
+                              val downloaded = downloadFile(fileId, fileName)
+                              if (downloaded != null) {
+                                  savedPak = downloaded
+                                  currentStep = "WAIT_UNPACK_PATH"
+                                  editMsg(
+                                      msgId,
+                                      "✅ *Downloaded:* `$fileName`\n\n👉 Send target folder or file path:\n(e.g. `/ShadowTrackerExtra/Content/BluePrints/Core/` or `.lua` path)"
+                                  )
+                              } else {
+                                  editMsg(msgId, "❌ Download failed.")
+                              }
+                          }
+                          "WAIT_REPACK_PAK" -> {
+                              val msgId = sendMsg("📥 Downloading Base `.pak`: `$fileName`...")
+                              val downloaded = downloadFile(fileId, fileName)
+                              if (downloaded != null) {
+                                  savedPak = downloaded
+                                  currentStep = "WAIT_REPACK_FILE"
+                                  editMsg(msgId, "✅ Base PAK saved.\n\n👉 Now upload the file you want to replace (`.uasset`, `.uexp`, `.lua`):")
+                              } else {
+                                  editMsg(msgId, "❌ Download failed.")
+                              }
+                          }
+                          "WAIT_REPACK_FILE" -> {
+                              val msgId = sendMsg("📥 Downloading replacement: `$fileName`...")
+                              val downloaded = downloadFile(fileId, fileName)
+                              if (downloaded != null && savedPak != null) {
+                                  editMsg(msgId, "⚙️ Repacking into `.pak`...\n`[████████░░] 80%`")
+                                  val outPak = File(context.cacheDir, "repacked_${savedPak!!.name}")
+                                  val ok = PakEngine.repackSingle(savedPak!!, downloaded, outPak)
+                                  if (ok) {
+                                      editMsg(msgId, "✅ *Repack Complete!* Uploading...")
+                                      uploadFile(outPak, "Repacked: ${outPak.name}")
+                                  } else {
+                                      editMsg(msgId, "❌ Target `$fileName` not found inside PAK index.")
+                                  }
+                                  currentStep = "IDLE"
+                              }
+                          }
                       }
                   }
               }
 
-              private fun startUnpackProcess(targetPath: String) {
-                  val pak = cachedPakFile
-                  if (pak == null || !pak.exists()) {
-                      sendText("❌ No PAK file cached. Please send /unpack again.")
+              private fun executeUnpack(targetPath: String) {
+                  val pak = savedPak ?: run {
+                      sendMsg("❌ No PAK cached. Send /unpack again.")
                       return
                   }
 
                   scope.launch {
-                      val progressMsgId = sendText("⚙️ *Starting Chunk Unpacker...*\nPath: `$targetPath`\n`[░░░░░░░░░░] 0%`")
+                      val msgId = sendMsg("🔍 Scanning index and unpacking...\n`[░░░░░░░░░░] 0%`")
+                      val outDir = File(context.cacheDir, "extracted_${System.currentTimeMillis()}")
 
-                      val outDir = File(context.cacheDir, "unpacked_${System.currentTimeMillis()}")
-                      val files = PakEngine.extractFiles(pak, targetPath, outDir) { percent ->
-                          val bar = getProgressBar(percent)
-                          editText(progressMsgId, "⚙️ *Unpacking in progress...*\nPath: `$targetPath`\n`$bar` $percent%")
+                      val files = PakEngine.extractMatching(pak, targetPath, outDir) { p ->
+                          val bar = "[" + "█".repeat(p / 10) + "░".repeat(10 - (p / 10)) + "]"
+                          editMsg(msgId, "⚙️ Unpacking `$targetPath`\n`$bar` $p%")
                       }
 
-                      editText(progressMsgId, "✅ *Unpack Completed!* Uploading extracted files to chat...")
-
-                      for (f in files) {
-                          uploadDocument(f, "Extracted file from: $targetPath")
-                      }
-
-                      currentMode = "IDLE"
-                  }
-              }
-
-              private fun getProgressBar(percent: Int): String {
-                  val totalBlocks = 10
-                  val filled = (percent / 10).coerceIn(0, totalBlocks)
-                  return "[" + "█".repeat(filled) + "░".repeat(totalBlocks - filled) + "]"
-              }
-
-              private fun downloadTelegramFile(fileId: String, fileName: String): File? {
-                  try {
-                      val getUrl = "https://api.telegram.org/bot$token/getFile?file_id=$fileId"
-                      val req = Request.Builder().url(getUrl).build()
-                      val resp = client.newCall(req).execute()
-                      val body = resp.body?.string() ?: return null
-                      val path = JSONObject(body).getJSONObject("result").getString("file_path")
-
-                      val downloadUrl = "https://api.telegram.org/file/bot$token/$path"
-                      val dReq = Request.Builder().url(downloadUrl).build()
-                      val dResp = client.newCall(dReq).execute()
-
-                      val target = File(context.cacheDir, fileName)
-                      dResp.body?.byteStream()?.use { input ->
-                          FileOutputStream(target).use { output ->
-                              input.copyTo(output)
+                      if (files.isEmpty()) {
+                          editMsg(msgId, "❌ No files matched path:\n`$targetPath`")
+                      } else {
+                          editMsg(msgId, "✅ Extracted *${files.size}* file(s)! Uploading to chat...")
+                          for (f in files) {
+                              uploadFile(f, "Name: ${f.name}\nSize: ${f.length()} bytes")
                           }
                       }
-                      return target
-                  } catch (e: Exception) {
-                      e.printStackTrace()
-                      return null
+                      currentStep = "IDLE"
                   }
               }
 
-              private fun uploadDocument(file: File, caption: String) {
+              private fun downloadFile(fileId: String, fileName: String): File? {
+                  return try {
+                      val u = "https://api.telegram.org/bot$token/getFile?file_id=$fileId"
+                      val r = Request.Builder().url(u).build()
+                      val body = client.newCall(r).execute().body?.string() ?: return null
+                      val path = JSONObject(body).getJSONObject("result").getString("file_path")
+
+                      val dlUrl = "https://api.telegram.org/file/bot$token/$path"
+                      val dlReq = Request.Builder().url(dlUrl).build()
+                      val target = File(context.cacheDir, fileName)
+
+                      client.newCall(dlReq).execute().body?.byteStream()?.use { inp ->
+                          FileOutputStream(target).use { out -> inp.copyTo(out) }
+                      }
+                      target
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              private fun uploadFile(file: File, caption: String) {
                   try {
-                      val body = MultipartBody.Builder()
+                      val form = MultipartBody.Builder()
                           .setType(MultipartBody.FORM)
-                          .addFormDataPart("chat_id", allowedChatId)
+                          .addFormDataPart("chat_id", adminChatId)
                           .addFormDataPart("caption", caption)
                           .addFormDataPart("document", file.name, file.asRequestBody("application/octet-stream".toMediaTypeOrNull()))
                           .build()
 
                       val req = Request.Builder()
                           .url("https://api.telegram.org/bot$token/sendDocument")
-                          .post(body)
+                          .post(form)
                           .build()
 
                       client.newCall(req).execute().close()
@@ -518,10 +591,10 @@ jobs:
                   }
               }
 
-              private fun sendText(text: String): Long {
-                  try {
+              private fun sendMsg(text: String): Long {
+                  return try {
                       val json = JSONObject().apply {
-                          put("chat_id", allowedChatId)
+                          put("chat_id", adminChatId)
                           put("text", text)
                           put("parse_mode", "Markdown")
                       }
@@ -532,20 +605,20 @@ jobs:
 
                       client.newCall(req).execute().use { res ->
                           val s = res.body?.string() ?: return 0L
-                          return JSONObject(s).optJSONObject("result")?.optLong("message_id") ?: 0L
+                          JSONObject(s).optJSONObject("result")?.optLong("message_id") ?: 0L
                       }
                   } catch (e: Exception) {
-                      return 0L
+                      0L
                   }
               }
 
-              private fun editText(messageId: Long, newText: String) {
+              private fun editMsg(messageId: Long, text: String) {
                   if (messageId == 0L) return
                   try {
                       val json = JSONObject().apply {
-                          put("chat_id", allowedChatId)
+                          put("chat_id", adminChatId)
                           put("message_id", messageId)
-                          put("text", newText)
+                          put("text", text)
                           put("parse_mode", "Markdown")
                       }
                       val req = Request.Builder()
@@ -555,13 +628,67 @@ jobs:
 
                       client.newCall(req).execute().close()
                   } catch (e: Exception) {
-                      // Silently ignore rate limits
+                      // Handled
                   }
               }
           }
           EOF
 
-          # 11. MainActivity.kt (Service Controller)
+          # 10. BotForegroundService.kt
+          cat << 'EOF' > app/src/main/java/com/pak/manager/BotForegroundService.kt
+          package com.pak.manager
+
+          import android.app.*
+          import android.content.Intent
+          import android.os.Build
+          import android.os.IBinder
+          import androidx.core.app.NotificationCompat
+
+          class BotForegroundService : Service() {
+              private var engine: TelegramEngine? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  createChannel()
+                  val notif = NotificationCompat.Builder(this, "pak_server_channel")
+                      .setContentTitle("PAK Bot Active")
+                      .setContentText("Worker listening for Telegram tasks...")
+                      .setSmallIcon(android.R.drawable.stat_notify_sync)
+                      .setOngoing(true)
+                      .build()
+
+                  startForeground(101, notif)
+
+                  val token = intent?.getStringExtra("TOKEN") ?: ""
+                  val chatId = intent?.getStringExtra("CHAT_ID") ?: ""
+
+                  if (engine == null && token.isNotEmpty()) {
+                      engine = TelegramEngine(this, token, chatId)
+                      engine?.start()
+                  }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  engine?.stop()
+                  super.onDestroy()
+              }
+
+              private fun createChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val c = NotificationChannel(
+                          "pak_server_channel",
+                          "PAK Server Daemon",
+                          NotificationManager.IMPORTANCE_LOW
+                      )
+                      getSystemService(NotificationManager::class.java)?.createNotificationChannel(c)
+                  }
+              }
+          }
+          EOF
+
+          # 11. MainActivity.kt
           cat << 'EOF' > app/src/main/java/com/pak/manager/MainActivity.kt
           package com.pak.manager
 
@@ -594,19 +721,19 @@ jobs:
                               modifier = Modifier.fillMaxSize(),
                               color = MaterialTheme.colorScheme.background
                           ) {
-                              BotServerDashboard(
-                                  onStartService = { token, chatId ->
-                                      val intent = Intent(this, BotForegroundService::class.java).apply {
+                              DashboardUI(
+                                  onStart = { token, chat ->
+                                      val it = Intent(this, BotForegroundService::class.java).apply {
                                           putExtra("TOKEN", token)
-                                          putExtra("CHAT_ID", chatId)
+                                          putExtra("CHAT_ID", chat)
                                       }
                                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                          startForegroundService(intent)
+                                          startForegroundService(it)
                                       } else {
-                                          startService(intent)
+                                          startService(it)
                                       }
                                   },
-                                  onStopService = {
+                                  onStop = {
                                       stopService(Intent(this, BotForegroundService::class.java))
                                   }
                               )
@@ -617,9 +744,9 @@ jobs:
           }
 
           @Composable
-          fun BotServerDashboard(
-              onStartService: (String, String) -> Unit,
-              onStopService: () -> Unit
+          fun DashboardUI(
+              onStart: (String, String) -> Unit,
+              onStop: () -> Unit
           ) {
               var botToken by remember { mutableStateOf("7630015663:AAHw-nYvbDamHjdcqrsBk2dw1bifSDllTLE") }
               var chatId by remember { mutableStateOf("5913394915") }
@@ -633,7 +760,7 @@ jobs:
                   verticalArrangement = Arrangement.spacedBy(16.dp)
               ) {
                   Text(
-                      text = "PAK Unpack/Repack Server",
+                      text = "PAK Manager Engine",
                       fontSize = 22.sp,
                       fontWeight = FontWeight.Bold,
                       color = MaterialTheme.colorScheme.primary
@@ -662,7 +789,7 @@ jobs:
                       Button(
                           onClick = {
                               isRunning = true
-                              onStartService(botToken, chatId)
+                              onStart(botToken, chatId)
                           },
                           enabled = !isRunning,
                           colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
@@ -676,7 +803,7 @@ jobs:
                       Button(
                           onClick = {
                               isRunning = false
-                              onStopService()
+                              onStop()
                           },
                           enabled = isRunning,
                           colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828)),
@@ -697,13 +824,13 @@ jobs:
                   ) {
                       Column(modifier = Modifier.padding(12.dp)) {
                           Text(
-                              text = "Foreground Service: " + if (isRunning) "RUNNING IN BACKGROUND" else "STOPPED",
+                              text = "Status: " + if (isRunning) "ACTIVE (Foreground Daemon)" else "STOPPED",
                               fontWeight = FontWeight.SemiBold,
                               color = if (isRunning) Color(0xFF81C784) else Color(0xFFE57373)
                           )
                           Spacer(modifier = Modifier.height(8.dp))
                           Text(
-                              text = "• Background Execution: Enabled\n• Auto Document Listener: Active\n• Live Progress Bar: Enabled\n• Path Parser: Active",
+                              text = "• Foreground Daemon: Persistent\n• Real File Matching: Enabled (.uasset, .uexp, .lua)\n• Index Offset & Size Reader: Active\n• Dynamic Live Bar: Enabled",
                               fontSize = 13.sp,
                               color = Color.LightGray
                           )
