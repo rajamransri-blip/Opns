@@ -54,37 +54,39 @@ jobs:
       - name: Auto-Detect, Merge & Extract
         shell: powershell
         run: |
-          Write-Host "=== STEP 1: Setting up Directories ==="
+          Write-Host "=== STEP 1: Directories Setup ==="
           if (-not (Test-Path "original_pak")) { New-Item -ItemType Directory -Path "original_pak" }
           if (-not (Test-Path "unpacked")) { New-Item -ItemType Directory -Path "unpacked" }
 
-          Write-Host "`n=== STEP 2: Locating Tools and Script ==="
+          Write-Host "=== STEP 2: Tool Detection ==="
           $bmsScript = (Get-ChildItem -Recurse -Filter "script.bms" | Select-Object -First 1).FullName
           $quickbms = (Get-ChildItem -Recurse -Filter "quickbms_4gb_files.exe" | Select-Object -First 1).FullName
           if (-not $quickbms) {
               $quickbms = (Get-ChildItem -Recurse -Filter "quickbms.exe" | Select-Object -First 1).FullName
           }
+
           Write-Host "QuickBMS: $quickbms"
           Write-Host "Script: $bmsScript"
 
-          Write-Host "`n=== STEP 3: Detecting File or Split Chunks ==="
+          Write-Host "=== STEP 3: File Detection & Merging ==="
           $targetPath = $null
 
-          # 1. Check if file was split into parts (.part_000, .part_001)
-          $parts = Get-ChildItem -Recurse -File | Where-Object { $_.Name -match "\.part_\d+$" } | Sort-Object Name
+          $parts = Get-ChildItem -Path "original_pak" -File | Where-Object { $_.Name -match "\.part_\d+$" } | Sort-Object Name
+          if (-not $parts) {
+              $parts = Get-ChildItem -Recurse -File | Where-Object { $_.Name -match "\.part_\d+$" } | Sort-Object Name
+          }
+
           if ($parts.Count -gt 0) {
-              Write-Host "Detected $($parts.Count) split part(s). Auto-merging..."
-              $mergedFile = "original_pak\recombined_game.pak"
+              Write-Host "Merging $($parts.Count) split chunk(s)..."
+              $mergedFile = "original_pak\game_patch.pak"
               $fs = [System.IO.File]::Create($mergedFile)
               foreach ($p in $parts) {
-                  Write-Host "Joining: $($p.Name) ($([math]::Round($p.Length/1MB, 2)) MB)"
                   $bytes = [System.IO.File]::ReadAllBytes($p.FullName)
                   $fs.Write($bytes, 0, $bytes.Length)
               }
               $fs.Close()
               $targetPath = (Get-Item $mergedFile).FullName
           } else {
-              # 2. Check for direct .pak or .obb
               $target = Get-ChildItem -Path "original_pak" -File | Where-Object { $_.Extension -match "\.(pak|obb)$" } | Select-Object -First 1
               if (-not $target) {
                   $target = Get-ChildItem -Recurse -File | Where-Object { $_.Extension -match "\.(pak|obb)$" } | Select-Object -First 1
@@ -95,16 +97,13 @@ jobs:
           }
 
           if (-not $targetPath -or -not (Test-Path $targetPath)) {
-              Write-Error "Error: Repository me koi file (.pak, .obb, ya .part_) nahi mili!"
-              Write-Host "Repository contents:"
-              Get-ChildItem -Recurse -File | ForEach-Object { Write-Host " - " $_.FullName.Replace("$PWD\", "") }
+              Write-Error "No game package found!"
               exit 1
           }
 
-          Write-Host "`n>> Target Confirmed: $targetPath ($([math]::Round((Get-Item $targetPath).Length/1MB, 2)) MB)"
+          Write-Host "Target Verified: $targetPath"
 
           $action = "${{ github.event.inputs.action_type }}"
-          Write-Host "`n=== STEP 4: Executing $action ==="
           if ($action -eq "unpack") {
               & "$quickbms" -o "$bmsScript" "$targetPath" "unpacked"
           } else {
@@ -112,27 +111,27 @@ jobs:
           }
 
       - name: Commit and Push unpacked files to Repo
-        shell: powershell
+        shell: bash
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          git pull origin main --rebase
+          git pull origin main --rebase || true
           git add unpacked/
 
-          git diff --staged --quiet
-          if ($LASTEXITCODE -ne 0) {
-              Write-Host "Unpacked folder ko repo me commit aur push kiya ja raha hai..."
-              git commit -m "Auto-unpacked files committed [skip ci]"
-              git push origin HEAD:main
-              Write-Host "✓ Saari extracted files repo ke 'unpacked/' folder me push ho gayi hain!"
-          } else {
-              Write-Host "unpacked/ folder me koi nayi changes nahi hain."
-          }
+          if ! git diff --staged --quiet; then
+            echo "Committing extracted files..."
+            git commit -m "Auto-unpacked files committed [skip ci]"
+            git push origin HEAD:main
+            echo "SUCCESS: Unpacked files successfully pushed to repo!"
+          else
+            echo "No new files to commit in unpacked/."
+          fi
 
       - name: Backup Artifact Zip
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: all-unpacked-files
+          name: game-unpacked-all
           path: unpacked/
           retention-days: 2
